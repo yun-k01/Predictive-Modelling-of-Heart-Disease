@@ -1,0 +1,366 @@
+---
+output: 
+  pdf_document:
+    latex_engine: xelatex
+header-includes:
+- \usepackage[fontsize=12pt]{scrextend}
+editor_options: 
+  markdown: 
+    wrap: 72
+mainfont: "Times New Roman"
+---
+\setcounter{page}{14}
+
+# *7.0 Appendix*
+
+```{r setup, results = 'hide', warning=FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+heart = read_csv("/Users/yunkyaw/Desktop/School/ADA/heart.csv")
+
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(corrplot)
+library(caret) # confusion matrix, random forest grid search
+library(car) # VIF
+library(doParallel) # parallel computing
+library(glmnet) # logistic regression
+library(MASS) # stepwise selection
+library(ResourceSelection) # hoslem.test
+library(pROC)
+library(randomForest)
+library(neuralnet)
+```
+
+
+# *7.1 EDA*
+
+## Data Cleaning
+```{r, results = 'hide', message = FALSE}
+str(heart)
+
+# sex, cp, fbs, restecg, exang, slope, thal, target should all be categorical
+heart$sex = as.factor(heart$sex)
+heart$cp = as.factor(heart$cp)
+heart$fbs = as.factor(heart$fbs)
+heart$restecg = as.factor(heart$restecg)
+heart$exang = as.factor(heart$exang)
+heart$slope = as.factor(heart$slope)
+heart$thal = as.factor(heart$thal)
+heart$target = as.factor(heart$target)
+
+str(heart)
+
+# factor columns
+factor_cols = sapply(heart, is.factor)
+
+# numeric columns
+num_cols = sapply(heart, is.numeric)
+
+# determining if there are any missing values
+colSums(is.na(heart))
+```
+
+## Looking at Distribution of Numeric Variables
+```{r, message=FALSE, warning=FALSE}
+# convert numeric variables into long data format
+melt.heart = melt(heart[num_cols])
+
+# plotting boxplot of each numeric variables to identify outliers and
+# distribution
+ggplot(data = melt.heart, aes(x = variable, y = value)) + 
+  geom_boxplot() +
+  labs(title = "Boxplots of Numeric Variables", x = "Variable", y = "Value")
+```
+
+## Looking at Distribution of Categorical Variables
+```{r, warning = FALSE}
+# convert categorical variables into long data format
+heart_fact = heart[factor_cols] %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Category")
+
+# plotting proportion of categorical responses
+ggplot(heart_fact, aes(x = Category, fill = Category)) +
+  geom_bar(aes(y = after_stat(prop), group = 1)) +
+  facet_wrap(~ Variable, scales = "free") +
+  labs(title = "Distribution of Categorical Variables", y = "Proportion") +
+  theme(legend.position = "none")
+
+```
+
+## Correlation Analysis
+```{r}
+# generate correlation matrix
+res = cor(heart[num_cols])
+
+# visualize correlation matrix
+corrplot(res, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+```
+
+## VIF - Assessing Multicollinearity
+```{r}
+# logistic regression model
+log_model = glm(target ~ ., family = "binomial", data = heart)
+
+# evaluate VIF scores
+vif_values = vif(log_model)
+vif_values
+```
+
+# *7.2 Data Analysis*
+## Test-Train Partition
+
+```{r}
+# making the training set 70% of the data
+smp_size = floor(0.7*nrow(heart))
+
+set.seed(123)
+train_ind = sample(seq_len(nrow(heart)), size = smp_size)
+train = heart[train_ind, ]   # defining training set
+test = heart[-train_ind, ]  # defining testing set
+```
+
+## Logistic Regression
+```{r}
+registerDoParallel(cores = 8) # parallel computing 
+
+# find best lambda to apply a penalty to the features
+set.seed(123)
+cvfit = cv.glmnet(as.matrix(train[, -14]), as.matrix(train[, 14]), nfolds = 10,
+                  alpha = 1, family = "binomial", parallel = TRUE)
+
+# final model - logistic regression with lasso penalty
+# selecting the lambda that produces the minimum MSE
+log_fit = glmnet(as.matrix(train[, -14]), as.matrix(train[, 14]), alpha = 1,
+                 family = "binomial", lambda = cvfit$lambda.min)
+
+stopImplicitCluster() # stop parallel computing
+
+# coefficients
+coef(log_fit)
+
+# exp(coef) for interpretation
+exp(coef(log_fit))
+```
+
+### Goodness of Fit
+```{r}
+# producing probability of each row belonging to the positive class
+log_prob = predict(log_fit, newx = as.matrix(test[, -14]))
+
+hoslem.test(as.numeric(test$target), log_prob, g = 10)
+# observe good fit as p < 0.05
+```
+
+### Generating Predictions and Confusion Matrix
+```{r}
+# predicting the class of each row with a 0.50 threshold
+log_pred = ifelse(log_prob > 0.5, 1, 0)
+
+# confusion matrix
+confusionMatrix(as.factor(log_pred), test$target)
+```
+\newpage
+
+### ROC Curve
+```{r, warning = FALSE, message = FALSE}
+# developing and plotting ROC curve
+roc_obj = roc(response = test$target, predictor = log_prob, type = "response")
+
+plot(roc_obj, legacy.axes = FALSE, print.auc = TRUE, print.three = TRUE,
+     cex.lab = 2)
+```
+
+```{r}
+# calculating area under the curve
+AUC = auc(roc_obj)
+
+# getting threshold, sensitivity, accuracy, and AUC for current model
+roc_log = c(coords(roc_obj, "b", ret = c("threshold", "se", "sp", "accuracy"), 
+                   best.method = "youden"), AUC)
+
+names(roc_log) = c("Threshold", "Sensitivity", "Specificity", "Accuracy", "AUC")
+
+t(roc_log)
+```
+
+### Changing Threshold
+```{r}
+log_pred_adj = ifelse(log_prob > 0.3762408, 1, 0)
+
+# accuracy
+log_accuracy = mean(log_pred_adj == test[, 14])
+
+# confusion matrix
+confusionMatrix(as.factor(log_pred_adj), test$target)
+```
+\newpage
+
+## Random Forest
+```{r}
+registerDoParallel(cores = 8) # parallel computing 
+
+set.seed(123)
+
+# control function for grid search, setting 10-fold cv repeated 3 times
+control = trainControl(method = "repeatedcv", number = 10, repeats = 3,
+                       search = "grid")
+
+# defining the grid parameters - mtry (number of splits per tree)
+grid = expand.grid(mtry = c(1:10))
+
+# training the random forest model with 10-fold cross validation and 1000 trees
+rf_gridsearch = train(target~., data=train, method="rf", tuneGrid = grid,
+                      trControl = control)
+
+plot(rf_gridsearch)
+# determine optimal mtry = 9
+
+# optimal random forest 
+rf_gridsearch
+```
+
+```{r}
+# Generating Optimal Model
+rfModel = randomForest(target ~ ., data = train, proximity = T, ntree = 1000, mtry = 9) 
+stopImplicitCluster() # stop parallel computing
+```
+
+```{r}
+rfModel
+```
+
+### Visualize Important Features
+```{r}
+# ranked features by importance using mean decrease gini index
+varImpPlot(rfModel)
+```
+
+### Generating Predictions and Confusion Matrix
+```{r}
+rf_prob = predict(rfModel, newdata = test[, -14], type = "prob")
+
+rf_pred = predict(rfModel, newdata = test[, -14], type = "response")
+
+confusionMatrix(rf_pred, test$target)
+```
+
+## Neural Network
+```{r}
+# train: scale numeric columns
+train[num_cols] = lapply(train[num_cols], function(x) scale(x))
+
+# train: convert all factor columns to numeric
+train[factor_cols] = lapply(train[factor_cols], function(x)
+  as.numeric(as.character(x)))
+
+# test: scale numeric columns
+test[num_cols] = lapply(test[num_cols], function(x) scale(x))
+
+# test: convert all factor columns to numeric
+test[factor_cols] = lapply(test[factor_cols], function(x) as.numeric(as.character(x)))
+```
+
+### Grid Search to Find Optimal Layers
+```{r}
+# generate neural network using grid search to find the optimal number of
+# layers and nodes
+
+# generating grid of hidden layer combinations
+grid = list(c(5), c(10), c(5, 3), c(10, 5), c(10, 10))
+
+# to store accuracies of each combination
+results = data.frame()
+
+registerDoParallel(cores = 8) # parallel computing 
+for (i in grid) {
+  set.seed(123)
+  nn_model = neuralnet(target ~ ., data = train, hidden = i,linear.output = FALSE)
+  
+  # predict
+  nn_prob = predict(nn_model, newdata = test[, -14], type = "prob")
+  
+  nn_pred = ifelse(nn_prob > 0.5, 1, 0)
+  
+  # accuracy
+  acc = mean(nn_pred == test[, 14])
+  
+  results = rbind(results, data.frame(Hidden = paste(i, collapse = "-"),
+                                      Accuracy = acc))
+}
+stopImplicitCluster() # stop parallel computing
+```
+
+```{r}
+results
+# find best results with one layer and 10 neurons
+```
+
+### Generating Optimal Neural Network
+```{r}
+nn_model = neuralnet(target ~ ., data = train, hidden = 10, linear.output = FALSE)
+```
+
+### Visualize Optimal Neural Network
+```{r}
+plot(nn_model, rep="best")
+```
+
+###  Generating Predictions and Confusion Matrix
+```{r}
+nn_prob = predict(nn_model, newdata = test[, -14], type = "prob")
+
+nn_pred = ifelse(nn_prob > 0.5, 1, 0)
+
+# confusion matrix
+confusionMatrix(as.factor(nn_pred), as.factor(test$target))
+```
+
+# *7.3 Comparison*
+## ROC Curves
+```{r, warning = FALSE, message=FALSE}
+# logistic regression
+roc_log = roc(response = test$target, predictor = log_prob)
+# AUC = 0.9254
+
+# random forest - looking at the probability of a positive observation
+roc_rf = roc(response = test$target, predictor = rf_prob[, "1"])
+# AUC = 1
+
+# neural network
+roc_nn = roc(response = test$target, predictor = nn_prob)
+# AUC = 0.9834
+
+# plotting
+plot(roc_log, legacy.axes = FALSE, cex.lab = 2, col = "green")
+lines(roc_log, col = "green")
+lines(roc_rf, col = "red")
+lines(roc_nn, col = "blue")
+legend("bottomright", legend = c("Logistic Regression (AUC = 0.9254)",
+                                 "Random Forest (AUC = 1)",
+                                 "Neural Network (AUC = 0.9834)"), 
+       col = c("green", "red", "blue"), lty = 1)
+```
+\newpage
+
+## Table of Accuracies
+```{r}
+# retrieved metric values from confusionMatrix for each model
+metrics = c("Accuracy", "Sensitivity", "Specificity", "AUC")
+log_metr = c(0.8766, 0.8759, 0.8773, 0.9254)
+rf_metr = c(0.9903, 1, 0.9816, 1)
+nn_metr = c(0.9838, 0.9793, 0.9877, 0.9834)
+
+results_table <- data.frame(
+  Metric = metrics,
+  Logistic_Regression = log_metr,
+  Random_Forest = rf_metr,
+  Neural_Network = nn_metr
+)
+
+t(results_table)
+```
+
